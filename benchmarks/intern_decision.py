@@ -1,8 +1,9 @@
-"""Verify and replay pinned Intern-Decision suites with the official evaluator."""
+"""Verify, collect and replay pinned Intern-Decision suites with the official evaluator."""
 
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import hashlib
 import importlib
 import importlib.util
@@ -227,6 +228,117 @@ def load_round(intern_root, scorer_root, round_dir):
     return responses, provenance, config
 
 
+def collect(args, *, transport=None):
+    """Collect one complete accuracy-v1 round, with five separate warmup requests."""
+    from benchmarks.client import DecisionClient, decode
+    from benchmarks.evidence import dump, outside_repo, write_json
+    from benchmarks.legs.leg1_public231 import validate_environment
+
+    verified = verify_sources(args.intern_root, args.scorer_root)
+    environment = args.run_meta.read_bytes()
+    meta = decode(environment)
+    validate_environment(meta)
+    controlled = {
+        "endpoint",
+        "path",
+        "model_configured",
+        "env_sha256",
+        "dataset",
+        "plan",
+        "stop_reason",
+        "attempted",
+        "collected",
+    }
+    if controlled.intersection(meta):
+        raise ValueError(f"run-meta contains collector-controlled fields: {sorted(controlled.intersection(meta))}")
+    bundle = Path(verified["intern_root"]) / "benchmarks/accuracy-v1"
+    items = [
+        (suite, line, row) for suite in SUITES for line, row in _rows(bundle / verified["datasets"][suite]["path"])
+    ]
+    output = outside_repo(args.out)
+    meta.update(
+        endpoint=args.endpoint,
+        path=args.path,
+        model_configured=args.model,
+        env_sha256=hashlib.sha256(environment).hexdigest(),
+        dataset=dict(
+            intern_revision=INTERN_REVISION,
+            jevbench_pin=SCORER_REVISION,
+            hashes=verified["files"],
+            dataset_hash=verified["manifest_sha256"],
+        ),
+        plan=dict(datasets=verified["datasets"], warmup=5, rounds=1),
+        stop_reason=None,
+    )
+    with closing(
+        DecisionClient(args.endpoint, path=args.path, model=args.model, timeout_s=args.timeout, transport=transport)
+    ) as client:
+        output.mkdir(parents=True, exist_ok=False)
+        (output / "environment.json").write_bytes(environment)
+        write_json(output / "run.meta.json", meta)
+        stop, errors, attempted = None, 0, 0
+        try:
+            for number, selected in ((0, items[:5]), (1, items)):
+                directory = output / ("warmup" if number == 0 else "round-1")
+                directory.mkdir()
+                with (directory / ("records.jsonl" if number == 0 else "results.jsonl")).open(
+                    "x", encoding="utf-8"
+                ) as stream:
+                    for suite, line, row in selected:
+                        body = _body(row)
+                        raw = client.request(body)
+                        path = _raw_path(directory, (suite, line, row["id"]), True)
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        write_json(path, raw)
+                        code, response = raw["http_status"], raw["response"]
+                        answers = response.get("answers") if isinstance(response, dict) else None
+                        parsed = isinstance(answers, dict) and all(
+                            isinstance(answers.get(field), dict) and answers[field].get("type") == question["type"]
+                            for field, question in body["questions"].items()
+                        )
+                        status = "ok" if parsed else "parse_error"
+                        if raw["client_error"] is not None:
+                            status = "client_error"
+                        elif code is None or not 200 <= code < 300:
+                            status = "refused" if code == 422 else "http_error"
+                        record = dict(
+                            suite=suite,
+                            source_line=line,
+                            task_id=row["id"],
+                            source_file=verified["datasets"][suite]["path"],
+                            round=number,
+                            kind="warmup" if number == 0 else "measured",
+                            attempted=True,
+                            ok=status == "ok",
+                            status=status,
+                            status_code=code,
+                            error=raw["client_error"] or (status if status != "ok" else None),
+                            ts=raw["ts"],
+                            latency_s=raw["latency_s"],
+                            raw_sha256=_sha256(path),
+                        )
+                        stream.write(dump(record) + "\n")
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                        attempted += number
+                        errors = errors + 1 if status != "ok" and code != 422 else 0
+                        if raw["client_error"] == "KeyboardInterrupt" or code in (401, 403, 429) or errors >= 3:
+                            stop = raw["client_error"] or "access/rate limit or three consecutive infrastructure errors"
+                            break
+                if stop:
+                    break
+        except KeyboardInterrupt:
+            stop = "interrupted"
+        except Exception as exc:
+            stop = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            meta.update(stop_reason=stop, attempted=attempted, collected=attempted == len(items) and stop is None)
+            write_json(output / "run.meta.final.json", meta)
+            (output / "run.meta.final.json").replace(output / "run.meta.json")
+    return output
+
+
 class SavedResponseEngine:
     """Sequential, unsharded evaluate() adapter; never normalizes saved answers."""
 
@@ -374,22 +486,36 @@ def replay_bundle(intern_root, scorer_root, responses, *, checkpoint, backend, t
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for command in ("verify", "replay"):
+    for command in ("verify", "replay", "collect"):
         child = commands.add_parser(command)
         child.add_argument("--intern-root", type=Path, required=True)
         child.add_argument("--scorer-root", type=Path, required=True)
         if command == "replay":
             child.add_argument("--round", type=Path, required=True, help="A's saved round-N directory")
             child.add_argument("--out", type=Path, required=True, help="New replay output directory")
+        if command == "collect":
+            child.add_argument("--endpoint", required=True)
+            child.add_argument("--path", choices=("/v1/decisions", "/v1/systemone"), required=True)
+            child.add_argument("--model")
+            child.add_argument("--timeout", type=float, default=120)
+            child.add_argument("--run-meta", type=Path, required=True)
+            child.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "verify":
         report = verify_sources(args.intern_root, args.scorer_root)
+    elif args.command == "collect":
+        report = {"run": str(collect(args))}
     else:
         responses, provenance, config = load_round(args.intern_root, args.scorer_root, args.round)
         report = replay_bundle(
             args.intern_root, args.scorer_root, responses, **config, output=args.out, provenance=provenance
         )
     print(json.dumps(report, indent=2))
+    if (
+        args.command == "collect"
+        and not json.loads((Path(report["run"]) / "run.meta.json").read_text(encoding="utf-8"))["collected"]
+    ):
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

@@ -57,6 +57,40 @@ parse and refusal failures remain failed attempts. Scored ledger columns are ign
 by hash. Retain the original run because raw files are referenced, not copied.
 Recorded configuration is provenance, not proof of the loaded weights.
 
+## Collect seven suites
+
+Use an already running authorized endpoint and an environment JSON containing
+`checkpoint.repo`/`revision`, `backend.name`/`version`, positive
+`sampling.temperature`, and `hardware`. Include actual dtype, libraries, context
+limits and JobID when applicable. The original file is saved unchanged and hashed.
+It must not contain collector-owned `endpoint`, `path`, `model_configured`,
+`env_sha256`, `dataset`, `plan`, `stop_reason`, `attempted` or `collected` fields.
+
+```bash
+python -m benchmarks.intern_decision collect \
+  --intern-root /path/to/Intern-Decision --scorer-root /path/to/jevbench \
+  --endpoint http://127.0.0.1:8000 --path /v1/decisions \
+  --run-meta /path/to/actual-environment.json --out /path/to/fresh-seven-suite-run
+python -m benchmarks.intern_decision replay \
+  --intern-root /path/to/Intern-Decision --scorer-root /path/to/jevbench \
+  --round /path/to/fresh-seven-suite-run/round-1 --out /path/to/fresh-seven-suite-replay
+```
+
+The shared client sends five separate warmups, then one serial accuracy round.
+All fields of a Typed Decisions row stay in one POST. Only state and questions
+(`type`, `instructions`, `criteria`) are model evidence; targets and IDs are omitted.
+Use `--model` only if the endpoint requires it; `--timeout` defaults to 120 seconds.
+`--path /v1/systemone` is also supported. No API key, automatic retry or resume is
+provided. This is separate from the public231 three-round latency matrix.
+
+Every attempt saves original raw evidence before its ledger record. HTTP
+401/403/429, three consecutive infrastructure failures, or an interrupt stop
+collection; 422 remains failed and resets the consecutive-failure counter.
+`run.meta.json` retains `stop_reason` and `attempted`. `collected=true` means every
+request was attempted, including failed answers; it does not mean scoring passed.
+A stop during warmup leaves all measured requests unattempted. Controlled early
+stops exit 2; unexpected exceptions exit nonzero; full collection exits 0.
+
 ## Scoring and completeness
 
 The unmodified upstream `src.eval.jev.evaluate` and table renderer perform scoring.
@@ -79,3 +113,6 @@ different input. This entry calls official `evaluate` directly because upstream'
 main/merge CLI requires those 10 references even for the bundled input. The table's
 Brier/ECE columns refer to JevBench hard. A complete replay establishes scoring
 coverage, not reproduction of published model quality or inference latency.
+
+[H800 results](results/intern-accuracy-v1-h800.md) report one complete run for the
+0.8B, 2B and 4B HF checkpoints.
