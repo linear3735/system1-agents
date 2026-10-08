@@ -6,6 +6,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ### Added
 
+- Intern-Decision seven-suite collection with raw HTTP evidence and H800 results
+  for the 0.8B, 2B and 4B checkpoints.
+
 - Intern-Decision input verification and offline replay with the official evaluator
   and explicit coverage for incomplete runs.
 

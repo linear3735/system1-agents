@@ -22,6 +22,22 @@ verify_sources = MODULE.verify_sources
 SUITES = MODULE.SUITES
 
 
+def collection_args(intern, scorer, directory, meta):
+    environment = directory.parent / "collector-environment.json"
+    source = directory.parent / "environment.json"
+    environment.write_bytes(source.read_bytes() if source.exists() else json.dumps(meta).encode())
+    return SimpleNamespace(
+        intern_root=intern,
+        scorer_root=scorer,
+        endpoint="http://fixture.invalid",
+        path="/v1/decisions",
+        model="protocol-fixture",
+        timeout=1.0,
+        run_meta=environment,
+        out=directory.parent / "collected",
+    )
+
+
 def fixture_answer(body):
     answers = {}
     for field, question in body["questions"].items():
@@ -33,6 +49,71 @@ def fixture_answer(body):
             labels = list(question["criteria"])
         answers[field] = {"type": question["type"], "probabilities": dict.fromkeys(labels, 1 / len(labels))}
     return {"answers": answers, "model": "protocol-fixture-no-model"}
+
+
+@pytest.fixture(scope="module")
+def full_collection(tmp_path_factory):
+    import httpx
+
+    intern, scorer = references()
+    root = tmp_path_factory.mktemp("full-seven-suite-collection")
+    meta = {
+        "checkpoint": {"repo": "protocol-fixture-no-model", "revision": "a" * 40},
+        "backend": {"name": "httpx-mock", "version": "fixture"},
+        "sampling": {"temperature": 1},
+        "hardware": "CPU protocol fixture",
+    }
+    args = collection_args(intern, scorer, root / "fixture", meta)
+    counts = {"requests": 0, "decisions": 0}
+
+    def handler(request):
+        body = json.loads(request.content)
+        assert set(body) == {"state", "questions", "thinking", "model"}
+        assert all(set(question) <= {"type", "instructions", "criteria"} for question in body["questions"].values())
+        counts["requests"] += 1
+        counts["decisions"] += len(body["questions"])
+        return httpx.Response(200, json=fixture_answer(body))
+
+    output = MODULE.collect(args, transport=httpx.MockTransport(handler))
+    saved, provenance, config = MODULE.load_round(intern, scorer, output / "round-1")
+    return intern, scorer, output, saved, provenance, config, counts
+
+
+def test_full_pinned_seven_suite_collection(full_collection):
+    _, _, output, saved, provenance, _, counts = full_collection
+    assert counts == {"requests": 10756, "decisions": 12356}
+    assert len(saved) == len(provenance["raw"]) == 10751
+    assert sum(len(response["answers"]) for response in saved.values()) == 12351
+    assert len(set(record["path"] for record in provenance["raw"])) == 10751
+    assert json.loads((output / "run.meta.json").read_text())["collected"] is True
+
+
+def test_full_pinned_collection_reuses_official_replay(full_collection):
+    if importlib.util.find_spec("torch") is None:
+        pytest.skip("full collection passed; official saved-response replay needs prepared Torch CPU dependencies")
+    intern, scorer, output, saved, provenance, config, _ = full_collection
+    report = MODULE.replay_bundle(
+        intern, scorer, saved, **config, output=output.parent / "official-replay", provenance=provenance
+    )
+    assert report["complete"], json.dumps(report, indent=2)
+    assert report["valid"] == report["planned_decisions"] == 12351
+    assert report["attempted"] == 10751
+
+
+def test_official_overflow_keeps_suite_failure_report(full_collection):
+    if importlib.util.find_spec("torch") is None:
+        pytest.skip("official OverflowError regression needs prepared Torch CPU dependencies")
+    intern, scorer, output, original, _, config, _ = full_collection
+    saved = dict(original)
+    key = next(iter(saved))
+    saved[key] = copy.deepcopy(saved[key])
+    probs = saved[key]["answers"]["decision"]["probabilities"]
+    probs[next(iter(probs))] = 10**400
+    target = output.parent / "official-overflow-replay"
+    report = MODULE.replay_bundle(intern, scorer, saved, **config, output=target)
+    assert not report["complete"] and report["planned_decisions"] == 12351
+    assert "OverflowError at source_line=1" in report["datasets"][SUITES[0]]["error"]
+    assert (target / "report.json").exists() and not (target / "complete.json").exists()
 
 
 def test_replay_catches_real_pinned_scorer_overflow_without_torch(tmp_path, monkeypatch):
@@ -73,6 +154,264 @@ def test_replay_catches_real_pinned_scorer_overflow_without_torch(tmp_path, monk
     assert "OverflowError at source_line=1" in report["datasets"][suite]["error"]
     assert (target / "report.json").exists() and not (target / "complete.json").exists()
     assert max(probs.values()) == 10**400
+
+
+def test_seven_suite_collection_uses_one_post_for_all_fields(disk_round):
+    import httpx
+
+    intern, scorer, directory, meta, _, _, _, _ = disk_round
+    verified = MODULE.verify_sources(intern, scorer)
+    for suite, entry in verified["datasets"].items():
+        source = intern / "benchmarks/accuracy-v1" / entry["path"]
+        row = json.loads(source.read_text())
+        row["questions"] = {"first": row.pop("question"), "second": {"type": "choice", "criteria": {"B": "b"}}}
+        row.update(targets={"first": "A", "second": "B"}, provenance={"private": "not model evidence"})
+        source.write_text(json.dumps(row) + "\n")
+        entry["decisions"] = 2
+        verified["files"][entry["path"]] = MODULE._sha256(source)
+    calls = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        calls.append(body)
+        assert set(body) == {"state", "questions", "thinking", "model"}
+        assert list(body["questions"]) == ["first", "second"]
+        return httpx.Response(200, json=fixture_answer(body))
+
+    args = collection_args(intern, scorer, directory, meta)
+    output = MODULE.collect(args, transport=httpx.MockTransport(handler))
+    saved, evidence, _ = MODULE.load_round(intern, scorer, output / "round-1")
+    assert len(calls) == 5 + 7  # Five warmups; never split the two fields into separate POSTs.
+    assert len(saved) == 7
+    assert {key[2] for key in saved} == {"item"}  # Reused IDs across suites cannot overwrite raw files.
+    assert len({row["path"] for row in evidence["raw"]}) == 7
+    assert all(value == fixture_answer(calls[5]) for value in saved.values())
+    final_meta = json.loads((output / "run.meta.json").read_text())
+    assert final_meta["collected"] and final_meta["attempted"] == 7
+    assert sum(entry["decisions"] for entry in final_meta["plan"]["datasets"].values()) == 14
+    assert not (output / "complete.json").exists()  # Collection does not establish official scoring success.
+    assert MODULE._sha256(output / "environment.json") == final_meta["env_sha256"]
+
+
+@pytest.mark.parametrize("failure,attempted", [(401, 1), (503, 3), (422, 7), ("timeout", 3), ("interrupt", 1)])
+def test_collection_preserves_failures_and_stops_without_claiming_scores(disk_round, failure, attempted):
+    import httpx
+
+    intern, scorer, directory, meta, _, _, _, _ = disk_round
+    calls = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        calls.append(body)
+        if len(calls) <= 5:
+            return httpx.Response(200, json=fixture_answer(body))
+        if failure == "interrupt":
+            raise KeyboardInterrupt
+        if failure == "timeout":
+            raise httpx.ReadTimeout("fixture timeout")
+        return httpx.Response(failure, json=fixture_answer(body))
+
+    output = MODULE.collect(collection_args(intern, scorer, directory, meta), transport=httpx.MockTransport(handler))
+    saved, evidence, _ = MODULE.load_round(intern, scorer, output / "round-1")
+    assert len(saved) == attempted and all(value is None for value in saved.values())
+    assert len(evidence["raw"]) == attempted
+    final_meta = json.loads((output / "run.meta.json").read_text())
+    assert final_meta["attempted"] == attempted
+    assert final_meta["collected"] is (failure == 422)
+    assert bool(final_meta["stop_reason"]) is (failure != 422)
+    records = [json.loads(line) for line in (output / "round-1/results.jsonl").read_text().splitlines()]
+    assert all(row["latency_s"] >= 0 and not row["ok"] for row in records)
+
+
+def test_collection_stopped_in_warmup_replays_as_unattempted(disk_round):
+    import httpx
+
+    intern, scorer, directory, meta, _, _, _, _ = disk_round
+    output = MODULE.collect(
+        collection_args(intern, scorer, directory, meta),
+        transport=httpx.MockTransport(lambda _: httpx.Response(429, text="rate limit")),
+    )
+    saved, evidence, config = MODULE.load_round(intern, scorer, output / "round-1")
+    assert saved == {} and evidence["results_sha256"] is None
+    report = MODULE.replay_bundle(intern, scorer, saved, **config, output=directory.parent / "stopped-replay")
+    assert report["planned"] == 7 and report["attempted"] == 0 and not report["complete"]
+
+
+def test_collect_cli_controlled_stop_returns_nonzero(disk_round, monkeypatch, capsys):
+    import httpx
+
+    intern, scorer, directory, meta, _, _, _, _ = disk_round
+    args = collection_args(intern, scorer, directory, meta)
+    original = MODULE.collect
+    monkeypatch.setattr(
+        MODULE,
+        "collect",
+        lambda options: original(options, transport=httpx.MockTransport(lambda _: httpx.Response(403, text="denied"))),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "intern_decision.py",
+            "collect",
+            "--intern-root",
+            str(intern),
+            "--scorer-root",
+            str(scorer),
+            "--endpoint",
+            args.endpoint,
+            "--path",
+            args.path,
+            "--run-meta",
+            str(args.run_meta),
+            "--out",
+            str(args.out),
+        ],
+    )
+    with pytest.raises(SystemExit) as stopped:
+        MODULE.main()
+    assert stopped.value.code == 2
+    assert json.loads(capsys.readouterr().out)["run"] == str(args.out)
+    assert json.loads((args.out / "run.meta.json").read_text())["collected"] is False
+
+
+@pytest.mark.parametrize(
+    "endpoint", ["http://user:DUMMY_SECRET@fixture.invalid", "http://fixture.invalid?key=DUMMY_SECRET"]
+)
+def test_collect_cli_rejects_credentials_before_output(disk_round, monkeypatch, endpoint):
+    import httpx
+
+    intern, scorer, directory, meta, _, _, _, _ = disk_round
+    args = collection_args(intern, scorer, directory, meta)
+    original = MODULE.collect
+    calls = []
+    monkeypatch.setattr(
+        MODULE,
+        "collect",
+        lambda options: original(options, transport=httpx.MockTransport(lambda request: calls.append(request))),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "intern_decision",
+            "collect",
+            "--intern-root",
+            str(intern),
+            "--scorer-root",
+            str(scorer),
+            "--endpoint",
+            endpoint,
+            "--path",
+            args.path,
+            "--run-meta",
+            str(args.run_meta),
+            "--out",
+            str(args.out),
+        ],
+    )
+    with pytest.raises(ValueError, match="without credentials"):
+        MODULE.main()
+    assert not args.out.exists() and not calls
+    assert all("DUMMY_SECRET" not in path.read_text() for path in directory.parent.rglob("*") if path.is_file())
+
+
+@pytest.mark.parametrize("failure", ["mkdir", "environment.json", "run.meta.json"])
+def test_collect_closes_client_when_output_setup_fails(disk_round, monkeypatch, failure):
+    import httpx
+    from benchmarks import client
+
+    intern, scorer, directory, meta, _, _, _, _ = disk_round
+    args = collection_args(intern, scorer, directory, meta)
+    created, calls = [], []
+    original_client, original_open = client.DecisionClient, Path.open
+
+    def make_client(*args, **kwargs):
+        result = original_client(*args, **kwargs)
+        created.append(result)
+        return result
+
+    def open_file(path, *options, **kwargs):
+        if path == args.out / failure:
+            raise OSError("fixture output failure")
+        return original_open(path, *options, **kwargs)
+
+    if failure == "mkdir":
+        args.out.mkdir()
+    monkeypatch.setattr(client, "DecisionClient", make_client)
+    monkeypatch.setattr(Path, "open", open_file)
+    with pytest.raises(OSError):
+        MODULE.collect(args, transport=httpx.MockTransport(lambda request: calls.append(request)))
+    assert len(created) == 1 and created[0].http.is_closed
+    assert not calls
+
+
+@pytest.mark.parametrize("unicode_field", ["task_id", "environment"])
+def test_collect_cli_writes_and_reads_utf8_under_non_utf8_locale(disk_round, unicode_field):
+    import subprocess
+    import sys
+
+    intern, scorer, directory, meta, _, _, _, _ = disk_round
+    args = collection_args(intern, scorer, directory, meta)
+    plan = MODULE.verify_sources(intern, scorer)["datasets"]
+    if unicode_field == "task_id":
+        for entry in plan.values():
+            path = intern / "benchmarks/accuracy-v1" / entry["path"]
+            row = json.loads(path.read_text(encoding="utf-8"))
+            row["id"] = "item\u2028unicode"
+            path.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+    else:
+        environment = json.loads(args.run_meta.read_text(encoding="utf-8"))
+        environment["hardware"] = "CPU\u2028fixture"
+        args.run_meta.write_text(json.dumps(environment, ensure_ascii=False), encoding="utf-8")
+    script = r"""
+import json, locale, sys
+from pathlib import Path
+import httpx
+from benchmarks import intern_decision as module
+encoding = locale.getpreferredencoding(False)
+if encoding.lower().replace("-", "") == "utf8":
+    sys.exit(77)
+print("locale=" + encoding)
+intern, scorer, environment, output = map(Path, sys.argv[1:5])
+plan = json.loads(sys.argv[5])
+module.verify_sources = lambda *_: dict(
+    intern_root=str(intern), scorer_root=str(scorer), datasets=plan,
+    files={}, manifest_sha256="fixture", source_revisions={})
+calls = []
+def handler(request):
+    calls.append(request)
+    return httpx.Response(200, json={"answers": {"decision": {"type": "choice", "probabilities": {"A": 1}}}})
+collect = module.collect
+module.collect = lambda args: collect(args, transport=httpx.MockTransport(handler))
+sys.argv = ["intern_decision", "collect", "--intern-root", str(intern), "--scorer-root", str(scorer),
+            "--endpoint", "http://fixture.invalid", "--path", "/v1/decisions",
+            "--run-meta", str(environment), "--out", str(output)]
+module.main()
+assert len(calls) == 12
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(intern), str(scorer), str(args.run_meta), str(args.out), json.dumps(plan)],
+        env=dict(
+            os.environ,
+            PYTHONPATH=str(Path(__file__).resolve().parents[2]),
+            PYTHONUTF8="0",
+            PYTHONCOERCECLOCALE="0",
+            LC_ALL="C",
+            PYTHONDONTWRITEBYTECODE="1",
+        ),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode == 77:
+        pytest.skip("This platform keeps locale C in UTF-8 mode")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.startswith("locale=")
+    assert json.loads((args.out / "run.meta.json").read_text(encoding="utf-8"))["collected"] is True
+    with (args.out / "round-1/results.jsonl").open(encoding="utf-8") as stream:
+        records = [json.loads(line) for line in stream]
+    assert len(records) == 7
+    if unicode_field == "task_id":
+        assert all(row["task_id"] == "item\u2028unicode" for row in records)
 
 
 def test_actual_a_loopback_output_replays_without_layout_assumptions(tmp_path, monkeypatch):
@@ -360,6 +699,38 @@ def test_replay_rejects_changed_complete_request_envelope(disk_round, change):
     save()  # Recompute the correct raw hash: request semantics still must be rejected.
     with pytest.raises(ValueError, match="request"):
         MODULE.load_round(intern, scorer, directory)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "endpoint",
+        "path",
+        "model_configured",
+        "env_sha256",
+        "dataset",
+        "plan",
+        "stop_reason",
+        "attempted",
+        "collected",
+    ],
+)
+def test_collector_rejects_environment_fields_it_controls(disk_round, field):
+    import httpx
+
+    intern, scorer, directory, meta, _, _, _, _ = disk_round
+    args = collection_args(intern, scorer, directory, meta)
+    environment = json.loads(args.run_meta.read_text())
+    environment[field] = None
+    args.run_meta.write_text(json.dumps(environment))
+    with pytest.raises(ValueError, match="controlled"):
+        MODULE.collect(
+            args,
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, json=fixture_answer(json.loads(request.content)))
+            ),
+        )
+    assert not args.out.exists()
 
 
 def test_disk_round_keeps_original_response_and_evidence(disk_round):
