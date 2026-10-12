@@ -6,6 +6,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ### Added
 
+- Public231 decision-model benchmark with raw HTTP evidence, pinned upstream scoring,
+  complete-denominator quality metrics and per-round service latency.
+
 - Optional local Cua-S1 4B inference through the `cua-four-b` extra and `CUA_S1_VARIANT=4b`, supporting text and
   multimodal input. Desktop `--pixel-target` offers named screenshot points; clicks remain bound to the observed
   window and capture.
@@ -43,6 +46,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ### Changed
 
+- Review guidance (`self-review`, `review-pr`) now treats merge readiness as a gate: authors confirm the pull
+  request reports mergeable with CI green on the recorded head before requesting review, and reviewers do not
+  approve a conflicting branch or a run pinned to an older commit.
+- `review-pr` reads for readability as well as correctness: names that say what they do, reviewable function
+  length, and the repository's house idioms, judged against those conventions rather than personal style.
 - Core Windows CI (`core (windows, 3.11)`) runs on pushes to `main` and the weekly schedule, not on every
   pull request. Linux `core` and `full` still run on PRs.
 
