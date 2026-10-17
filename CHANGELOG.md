@@ -6,6 +6,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ### Added
 
+- Intern-Decision input verification and offline replay with the official evaluator
+  and explicit coverage for incomplete runs.
+
 - Public231 decision-model benchmark with raw HTTP evidence, pinned upstream scoring,
   complete-denominator quality metrics and per-round service latency.
 
