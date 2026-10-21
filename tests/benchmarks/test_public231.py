@@ -198,6 +198,8 @@ def collect(reference, monkeypatch, tmp_path):
             task = lookup[dump(body)]
             calls.append(body)
             status = statuses[min(len(calls) - 1, len(statuses) - 1)] if statuses else 200
+            if isinstance(status, (httpx.HTTPError, KeyboardInterrupt)):
+                raise status
             if response_text is not None:
                 return httpx.Response(status, text=response_text)
             answer = {
@@ -341,8 +343,49 @@ def test_debug_run_is_insufficient_with_fixed_denominator(collect, options):
         assert result["rounds"][0]["accuracy"] == 10 / 231
 
 
+def test_collection_plan_counts_selected_tasks_with_fixed_score_denominator(collect):
+    run, calls, _ = collect(warmup=2, rounds=1, limit=10)
+    assert json.loads((run / "warmup/predict.meta.json").read_text())["planned"] == 2
+    assert json.loads((run / "round-1/predict.meta.json").read_text())["planned"] == 10
+    result = aggregate(run)
+    assert len(calls) == 12 and result["pooled"]["attempted"] == 10
+    assert result["pooled"]["planned"] == 231 and result["pooled"]["accuracy"] == 10 / 231
+    assert not result["sufficient"]
+
+
+@pytest.mark.parametrize("status", [200, 201])
+@pytest.mark.parametrize("response_text", ["broken json", '{"answers":{"decision":{"type":"wrong"}}}'])
+def test_malformed_http_success_does_not_stop_collection(collect, status, response_text):
+    run, calls, _ = collect(warmup=0, rounds=1, limit=4, statuses=[status], response_text=response_text)
+    result = aggregate(run)["pooled"]
+    records = [json.loads(line) for line in (run / "round-1/results.jsonl").read_text().splitlines()]
+    assert len(calls) == result["attempted"] == 4
+    assert all(row["status"] == "parse_error" and not row["ok"] for row in records)
+    assert result["planned"] == 231 and result["correct"] == result["valid"] == result["accuracy"] == 0
+    assert result["latency"]["failure"]["n"] == 4 and result["latency"]["success"]["n"] == 0
+    assert json.loads((run / "completion.json").read_text())["stop_reason"] is None
+
+
+def test_malformed_http_success_resets_infrastructure_streak(collect):
+    run, calls, _ = collect(warmup=0, rounds=1, statuses=[500, 500, 200, 500, 500, 500], response_text="broken json")
+    result = aggregate(run)["pooled"]
+    assert len(calls) == result["attempted"] == 6
+    assert result["accuracy"] == 0 and result["planned"] == 231
+    assert json.loads((run / "completion.json").read_text())["stop_reason"]
+
+
 @pytest.mark.parametrize(
-    "statuses,attempted", [([401], 1), ([403], 1), ([429], 1), ([500], 3), ([500, 500, 422, 500, 500, 500], 6)]
+    "statuses,attempted",
+    [
+        ([401], 1),
+        ([403], 1),
+        ([429], 1),
+        ([500], 3),
+        ([httpx.ReadTimeout("fixture timeout")], 3),
+        ([500, httpx.ConnectError("fixture connection failure"), 503], 3),
+        ([KeyboardInterrupt()], 1),
+        ([500, 500, 422, 500, 500, 500], 6),
+    ],
 )
 def test_stop_policy_leaves_unattempted_in_plan(collect, statuses, attempted):
     run, calls, _ = collect(warmup=0, statuses=statuses)

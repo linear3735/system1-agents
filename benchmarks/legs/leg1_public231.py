@@ -81,9 +81,7 @@ def predict(args):
                 directory = output / ("warmup" if number == 0 else f"round-{number}")
                 (directory / "raw").mkdir(parents=True)
                 selected = items[: args.warmup if number == 0 else args.limit]
-                write_json(
-                    directory / "predict.meta.json", dict(round=number, planned=args.warmup if number == 0 else 231)
-                )
+                write_json(directory / "predict.meta.json", dict(round=number, planned=len(selected)))
                 with (directory / ("records.jsonl" if number == 0 else "results.jsonl")).open(
                     "x", encoding="utf-8"
                 ) as stream:
@@ -100,7 +98,7 @@ def predict(args):
                         if raw["client_error"] == "KeyboardInterrupt":
                             stop = "interrupted"
                             break
-                        errors = errors + 1 if not record["ok"] and record["status_code"] != 422 else 0
+                        errors = errors + 1 if record["status"] in ("client_error", "http_error") else 0
                         if record["status_code"] in (401, 403, 429) or errors >= 3:
                             stop = "access/rate limit or three consecutive infrastructure errors"
                             break

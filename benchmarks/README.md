@@ -56,6 +56,9 @@ outside this tool if needed; it does not accept or save API keys.
 
 - Each round's accuracy is **correct / 231**. Failures and unattempted questions stay
   in the denominator. Three repeated rounds provide timing samples, not 693 unique questions.
+- Each `predict.meta.json` records the selected collection count in `planned`:
+  `--warmup` for warmups and `--limit` for measured rounds. The summary's `planned`
+  and accuracy denominator remain the full 231 questions per measured round.
 - Upstream schema validity, Brier and ECE are reported separately. Missing probabilities
   are not replaced with one-hot predictions. Native `noul` scalars become `{no: 1-p, yes: p}`.
 - Per-round and pooled p50/p95 cover HTTP POST through full response receipt. All attempts,
@@ -63,7 +66,8 @@ outside this tool if needed; it does not accept or save API keys.
 - `sufficient=true` requires five warmups and three complete 231-question rounds.
   `--limit`, fewer rounds or missing attempts produce partial observations.
 - HTTP 401/403/429, interruption or three consecutive infrastructure failures stop collection.
-  HTTP 422 counts as a failed question and does not trigger that stop counter.
+  Infrastructure failures are client/transport errors or non-2xx responses other than HTTP 422.
+  HTTP 422 and malformed 2xx answers count as failed questions and reset that stop counter.
 
 Evidence goes in a fresh directory **outside the repository**. Each round contains
 `results.jsonl` and `raw/<sha256(task_id)>.json`; warmups are separate. Raw records retain
